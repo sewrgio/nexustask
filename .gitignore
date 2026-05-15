@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+app.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
