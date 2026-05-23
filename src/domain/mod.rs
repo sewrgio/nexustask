@@ -3,3 +3,7 @@ pub mod task;
 pub mod workspace;
 pub mod comment;
 pub mod audit;
+pub mod custom_field;
+pub mod reaction;
+pub mod attachment;
+pub mod snapshot;

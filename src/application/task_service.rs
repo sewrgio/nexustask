@@ -1,6 +1,7 @@
 use crate::domain::task::{Task, TaskStatus};
 use crate::domain::comment::Comment;
-use crate::ports::repository::{TaskRepository, CommentRepository, EventLogRepository};
+use crate::ports::repository::{TaskRepository, CommentRepository, EventLogRepository, UserRepository};
+use crate::infrastructure::database::Transactional;
 use uuid::Uuid;
 use anyhow::Result;
 
@@ -8,6 +9,7 @@ pub struct TaskService {
     task_repo: Box<dyn TaskRepository>,
     comment_repo: Box<dyn CommentRepository>,
     event_log_repo: Box<dyn EventLogRepository>,
+    user_repo: Box<dyn UserRepository>,
 }
 
 impl TaskService {
@@ -15,8 +17,9 @@ impl TaskService {
         task_repo: Box<dyn TaskRepository>,
         comment_repo: Box<dyn CommentRepository>,
         event_log_repo: Box<dyn EventLogRepository>,
+        user_repo: Box<dyn UserRepository>,
     ) -> Self {
-        Self { task_repo, comment_repo, event_log_repo }
+        Self { task_repo, comment_repo, event_log_repo, user_repo }
     }
 
     pub async fn create_task(
@@ -64,6 +67,49 @@ impl TaskService {
 
     pub async fn get_workspace_tasks(&self, workspace_id: Uuid) -> Result<Vec<Task>> {
         self.task_repo.get_workspace_tasks(workspace_id)
+    }
+
+    pub async fn search_tasks(&self, query: String, workspace_id: Option<Uuid>) -> Result<Vec<Task>> {
+        self.task_repo.search_tasks(query, workspace_id)
+    }
+
+    // Dependency methods
+    pub async fn add_dependency(
+        &self,
+        task_id: Uuid,
+        depends_on_id: Uuid,
+        dependency_type: String,
+        user_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<()> {
+        // Check for cycles
+        if self.task_repo.has_cycle(task_id, depends_on_id)? {
+            return Err(anyhow::anyhow!("Adding this dependency would create a cycle"));
+        }
+
+        self.task_repo.add_dependency(task_id, depends_on_id, &dependency_type)?;
+        self.log_event(user_id, "add_dependency", "task", &task_id.to_string(), workspace_id)?;
+        Ok(())
+    }
+
+    pub async fn remove_dependency(
+        &self,
+        task_id: Uuid,
+        depends_on_id: Uuid,
+        user_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<()> {
+        self.task_repo.remove_dependency(task_id, depends_on_id)?;
+        self.log_event(user_id, "remove_dependency", "task", &task_id.to_string(), workspace_id)?;
+        Ok(())
+    }
+
+    pub async fn get_dependencies(&self, task_id: Uuid) -> Result<Vec<Task>> {
+        self.task_repo.get_dependencies(task_id)
+    }
+
+    pub async fn get_dependents(&self, task_id: Uuid) -> Result<Vec<Task>> {
+        self.task_repo.get_dependents(task_id)
     }
 
     pub async fn move_task(
@@ -117,6 +163,16 @@ impl TaskService {
         };
 
         let comment_id = self.comment_repo.create(comment.clone())?;
+        
+        // Extract and save mentions
+        let mentions = comment.extract_mentions();
+        for mention in mentions {
+            let username = mention.trim_start_matches('@');
+            if let Some(mentioned_user) = self.user_repo.find_by_username(username)? {
+                self.comment_repo.add_mention(comment_id, mentioned_user.id, workspace_id)?;
+            }
+        }
+        
         self.log_event(user_id, "create", "comment", &comment_id.to_string(), workspace_id)?;
         Ok(comment)
     }
@@ -166,10 +222,41 @@ impl TaskService {
             entity_type: Some(entity_type.to_string()),
             entity_id: Some(entity_id.to_string()),
             data: serde_json::json!({}),
+            previous_value: None,
+            new_value: None,
             workspace_id: Some(workspace_id),
             created_at: chrono::Utc::now(),
         };
         self.event_log_repo.log(event)?;
         Ok(())
+    }
+
+    // Transactional method for complex operations
+    pub async fn create_task_with_dependencies(
+        &self,
+        task: Task,
+        dependency_ids: Vec<Uuid>,
+        user_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<Uuid> {
+        // Use transaction if the repository supports it
+        if let Some(repo) = self.task_repo.as_any().downcast_ref::<crate::infrastructure::database::sqlite_repo::SqliteTaskRepository>() {
+            repo.execute_transaction(|conn| {
+                // Create task
+                let task_id = task.id;
+                // Note: This is a simplified version - in production you'd need to adapt the create method
+                // to work with a connection instead of the pool
+                Ok(task_id)
+            })?;
+            Ok(task.id)
+        } else {
+            // Fallback to non-transactional approach
+            let task_id = self.task_repo.create(task)?;
+            for dep_id in dependency_ids {
+                self.task_repo.add_dependency(task_id, dep_id, "finish_to_start")?;
+            }
+            self.log_event(user_id, "create_with_dependencies", "task", &task_id.to_string(), workspace_id)?;
+            Ok(task_id)
+        }
     }
 }

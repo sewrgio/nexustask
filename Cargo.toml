@@ -27,9 +27,12 @@ utoipa-swagger-ui = { version = "4.0", features = ["axum"] }
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
 
 # Async
 tokio = { version = "1.0", features = ["full"] }
+tokio-cron-scheduler = "0.10"
 
 # Security
 argon2 = "0.5"
@@ -46,3 +49,9 @@ zstd = "0.13"
 log = "0.4"
 env_logger = "0.11"
 cron = "0.12"
+
+# HTTP & Webhooks
+reqwest = { version = "0.11", features = ["json"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

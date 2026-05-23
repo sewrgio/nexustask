@@ -126,7 +126,11 @@ CREATE TABLE IF NOT EXISTS event_log (
     entity_type TEXT,
     entity_id TEXT,
     data TEXT NOT NULL DEFAULT '{}',
+    previous_value TEXT,
+    new_value TEXT,
     workspace_id TEXT REFERENCES workspaces(id),
+    ip_address TEXT,
+    user_agent TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -158,3 +162,77 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON user_sessions(token);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions(user_id);
+
+-- 9. Task Dependencies
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    dependency_type TEXT CHECK(dependency_type IN ('finish_to_start', 'start_to_start', 'finish_to_finish', 'start_to_finish')) DEFAULT 'finish_to_start',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(task_id, depends_on_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_deps_task ON task_dependencies(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_deps_depends_on ON task_dependencies(depends_on_id);
+
+-- 10. Comment Mentions
+CREATE TABLE IF NOT EXISTS comment_mentions (
+    id TEXT PRIMARY KEY,
+    comment_id TEXT NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+    mentioned_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    is_read BOOLEAN DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(comment_id, mentioned_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mentions_comment ON comment_mentions(comment_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_user ON comment_mentions(mentioned_user_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_workspace ON comment_mentions(workspace_id);
+
+-- 11. Comment Reactions
+CREATE TABLE IF NOT EXISTS comment_reactions (
+    id TEXT PRIMARY KEY,
+    comment_id TEXT NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    emoji TEXT NOT NULL,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(comment_id, user_id, emoji)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reactions_comment ON comment_reactions(comment_id);
+CREATE INDEX IF NOT EXISTS idx_reactions_user ON comment_reactions(user_id);
+
+-- 12. File Attachments
+CREATE TABLE IF NOT EXISTS file_attachments (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL CHECK(entity_type IN ('task', 'comment')),
+    entity_id TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    file_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    mime_type TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_attachments_entity ON file_attachments(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_user ON file_attachments(user_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_workspace ON file_attachments(workspace_id);
+
+-- 13. Entity Snapshots
+CREATE TABLE IF NOT EXISTS entity_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    snapshot_data TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES users(id),
+    workspace_id TEXT REFERENCES workspaces(id),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_entity ON entity_snapshots(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_created ON entity_snapshots(created_at);

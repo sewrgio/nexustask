@@ -3,19 +3,22 @@ use crate::domain::user::User;
 use crate::domain::workspace::{Workspace, WorkspaceMember, WorkspaceRole};
 use crate::domain::comment::Comment;
 use crate::domain::audit::EventLog;
-use crate::ports::repository::{TaskRepository, UserRepository, WorkspaceRepository, WorkspaceMemberRepository, CommentRepository, EventLogRepository};
+use crate::domain::custom_field::{CustomField, CustomFieldType};
+use crate::ports::repository::{TaskRepository, UserRepository, WorkspaceRepository, WorkspaceMemberRepository, CommentRepository, EventLogRepository, CustomFieldRepository};
+use crate::infrastructure::database::Transactional;
 use rusqlite::{params, Connection, Row};
 use uuid::Uuid;
 use anyhow::Result;
-use std::sync::{Arc, Mutex};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 
 pub struct SqliteTaskRepository {
-    conn: Arc<Mutex<Connection>>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl SqliteTaskRepository {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: Pool<SqliteConnectionManager>) -> Self {
+        Self { pool }
     }
 
     fn row_to_task(row: &Row) -> std::result::Result<Task, rusqlite::Error> {
@@ -47,7 +50,7 @@ impl SqliteTaskRepository {
     }
 
     fn recalculate_nested_set(&self, workspace_id: Uuid) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         // Get all tasks ordered by creation
         let mut stmt = conn.prepare(
             "SELECT id, parent_id FROM tasks WHERE workspace_id = ?1 ORDER BY created_at"
@@ -99,9 +102,29 @@ impl SqliteTaskRepository {
     }
 }
 
+impl Transactional for SqliteTaskRepository {
+    fn execute_transaction<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R>,
+    {
+        let conn = self.pool.get()?;
+        conn.execute("BEGIN TRANSACTION", [])?;
+        let result = f(&conn);
+        match &result {
+            Ok(_) => {
+                conn.execute("COMMIT", [])?;
+            }
+            Err(_) => {
+                conn.execute("ROLLBACK", [])?;
+            }
+        }
+        result
+    }
+}
+
 impl TaskRepository for SqliteTaskRepository {
     fn create(&self, task: Task) -> Result<Uuid> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         
         // Calculate nested set if has parent
         let (lft, rgt, depth) = if let Some(parent_id) = task.parent_id {
@@ -162,7 +185,7 @@ impl TaskRepository for SqliteTaskRepository {
     }
 
     fn update(&self, task: Task) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE tasks SET title = ?2, description = ?3, status = ?4, priority = ?5, assigned_to = ?6, updated_at = ?7, version = version + 1 WHERE id = ?1",
             params![
@@ -179,13 +202,13 @@ impl TaskRepository for SqliteTaskRepository {
     }
 
     fn delete(&self, id: Uuid) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute("DELETE FROM tasks WHERE id = ?1", params![id.to_string()])?;
         Ok(())
     }
 
     fn find_by_id(&self, id: Uuid) -> Result<Option<Task>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let result = conn.query_row(
             "SELECT * FROM tasks WHERE id = ?1",
             [id.to_string()],
@@ -199,7 +222,7 @@ impl TaskRepository for SqliteTaskRepository {
     }
 
     fn get_tree(&self, root_id: Uuid) -> Result<Vec<Task>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let root = self.find_by_id(root_id)?;
         match root {
             Some(r) => {
@@ -217,7 +240,7 @@ impl TaskRepository for SqliteTaskRepository {
     }
 
     fn get_workspace_tasks(&self, workspace_id: Uuid) -> Result<Vec<Task>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM tasks WHERE workspace_id = ?1 ORDER BY lft"
         )?;
@@ -236,7 +259,7 @@ impl TaskRepository for SqliteTaskRepository {
         let task = task.unwrap();
         
         // Remove from old position
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE tasks SET lft = lft - 2, rgt = rgt - 2 WHERE lft > ?1",
             [task.rgt.to_string()],
@@ -281,7 +304,7 @@ impl TaskRepository for SqliteTaskRepository {
     }
 
     fn get_subordinates(&self, user_id: Uuid) -> Result<Vec<User>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "WITH RECURSIVE subordinates AS (
                 SELECT * FROM users WHERE manager_id = ?1
@@ -297,15 +320,128 @@ impl TaskRepository for SqliteTaskRepository {
         )?.collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(users)
     }
+
+    fn search_tasks(&self, query: String, workspace_id: Option<Uuid>) -> Result<Vec<Task>> {
+        let conn = self.pool.get()?;
+        
+        let sql = if let Some(ws_id) = workspace_id {
+            "SELECT t.* FROM tasks t
+             INNER JOIN tasks_fts fts ON t.id = fts.rowid
+             WHERE tasks_fts MATCH ?1 AND t.workspace_id = ?2"
+                .to_string()
+        } else {
+            "SELECT t.* FROM tasks t
+             INNER JOIN tasks_fts fts ON t.id = fts.rowid
+             WHERE tasks_fts MATCH ?1"
+                .to_string()
+        };
+        
+        let mut stmt = conn.prepare(&sql)?;
+        
+        let tasks = if let Some(ws_id) = workspace_id {
+            stmt.query_map(
+                [query, ws_id.to_string()],
+                |row| SqliteTaskRepository::row_to_task(row)
+            )?.collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(
+                [query],
+                |row| SqliteTaskRepository::row_to_task(row)
+            )?.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        
+        Ok(tasks)
+    }
+
+    fn add_dependency(&self, task_id: Uuid, depends_on_id: Uuid, dependency_type: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        let id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO task_dependencies (id, task_id, depends_on_id, dependency_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.to_string(),
+                task_id.to_string(),
+                depends_on_id.to_string(),
+                dependency_type,
+                chrono::Utc::now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn remove_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "DELETE FROM task_dependencies WHERE task_id = ?1 AND depends_on_id = ?2",
+            params![task_id.to_string(), depends_on_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn get_dependencies(&self, task_id: Uuid) -> Result<Vec<Task>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.* FROM tasks t
+             INNER JOIN task_dependencies td ON t.id = td.depends_on_id
+             WHERE td.task_id = ?1"
+        )?;
+        let tasks = stmt.query_map(
+            [task_id.to_string()],
+            |row| SqliteTaskRepository::row_to_task(row)
+        )?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    fn get_dependents(&self, task_id: Uuid) -> Result<Vec<Task>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.* FROM tasks t
+             INNER JOIN task_dependencies td ON t.id = td.task_id
+             WHERE td.depends_on_id = ?1"
+        )?;
+        let tasks = stmt.query_map(
+            [task_id.to_string()],
+            |row| SqliteTaskRepository::row_to_task(row)
+        )?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    fn has_cycle(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<bool> {
+        // Use DFS to detect cycles in the dependency graph
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![depends_on_id];
+        
+        while let Some(current_id) = stack.pop() {
+            if current_id == task_id {
+                return Ok(true);
+            }
+            if visited.contains(&current_id) {
+                continue;
+            }
+            visited.insert(current_id);
+            
+            let deps = self.get_dependencies(current_id)?;
+            for dep in deps {
+                stack.push(dep.id);
+            }
+        }
+        
+        Ok(false)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 pub struct SqliteUserRepository {
-    conn: Arc<Mutex<Connection>>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl SqliteUserRepository {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: Pool<SqliteConnectionManager>) -> Self {
+        Self { pool }
     }
 
     fn row_to_user(row: &Row) -> std::result::Result<User, rusqlite::Error> {
@@ -333,7 +469,7 @@ impl SqliteUserRepository {
 
 impl UserRepository for SqliteUserRepository {
     fn create(&self, user: User) -> Result<Uuid> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "INSERT INTO users (id, username, email, password_hash, full_name, role, manager_id, is_active, metadata, created_at, last_login)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -355,7 +491,7 @@ impl UserRepository for SqliteUserRepository {
     }
 
     fn find_by_id(&self, id: Uuid) -> Result<Option<User>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let result = conn.query_row(
             "SELECT * FROM users WHERE id = ?1",
             [id.to_string()],
@@ -369,7 +505,7 @@ impl UserRepository for SqliteUserRepository {
     }
 
     fn find_by_username(&self, username: &str) -> Result<Option<User>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let result = conn.query_row(
             "SELECT * FROM users WHERE username = ?1",
             [username],
@@ -383,7 +519,7 @@ impl UserRepository for SqliteUserRepository {
     }
 
     fn find_by_email(&self, email: &str) -> Result<Option<User>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let result = conn.query_row(
             "SELECT * FROM users WHERE email = ?1",
             [email],
@@ -397,7 +533,7 @@ impl UserRepository for SqliteUserRepository {
     }
 
     fn update(&self, user: User) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE users SET username = ?2, email = ?3, full_name = ?4, role = ?5, manager_id = ?6, is_active = ?7, metadata = ?8 WHERE id = ?1",
             params![
@@ -415,22 +551,32 @@ impl UserRepository for SqliteUserRepository {
     }
 
     fn update_last_login(&self, user_id: Uuid) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE users SET last_login = ?1 WHERE id = ?2",
             params![chrono::Utc::now(), user_id.to_string()],
         )?;
         Ok(())
     }
+
+    fn get_workload(&self, user_id: Uuid) -> Result<i32> {
+        let conn = self.pool.get()?;
+        let count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE assigned_to = ?1 AND status != 'done'",
+            [user_id.to_string()],
+            |row| row.get(0)
+        )?;
+        Ok(count)
+    }
 }
 
 pub struct SqliteWorkspaceRepository {
-    conn: Arc<Mutex<Connection>>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl SqliteWorkspaceRepository {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: Pool<SqliteConnectionManager>) -> Self {
+        Self { pool }
     }
 
     fn row_to_workspace(row: &Row) -> std::result::Result<Workspace, rusqlite::Error> {
@@ -453,7 +599,7 @@ impl SqliteWorkspaceRepository {
 
 impl WorkspaceRepository for SqliteWorkspaceRepository {
     fn create(&self, workspace: Workspace) -> Result<Uuid> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "INSERT INTO workspaces (id, name, slug, description, owner_id, parent_workspace_id, lft, rgt, depth, settings, created_at, is_active)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -476,7 +622,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
     }
 
     fn find_by_id(&self, id: Uuid) -> Result<Option<Workspace>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let result = conn.query_row(
             "SELECT * FROM workspaces WHERE id = ?1",
             [id.to_string()],
@@ -490,7 +636,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
     }
 
     fn find_by_slug(&self, slug: &str) -> Result<Option<Workspace>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let result = conn.query_row(
             "SELECT * FROM workspaces WHERE slug = ?1",
             [slug],
@@ -504,7 +650,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
     }
 
     fn update(&self, workspace: Workspace) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE workspaces SET name = ?2, slug = ?3, description = ?4, settings = ?5, is_active = ?6 WHERE id = ?1",
             params![
@@ -520,7 +666,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
     }
 
     fn get_user_workspaces(&self, user_id: Uuid) -> Result<Vec<Workspace>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "SELECT w.* FROM workspaces w
              INNER JOIN workspace_members wm ON w.id = wm.workspace_id
@@ -535,12 +681,12 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
 }
 
 pub struct SqliteWorkspaceMemberRepository {
-    conn: Arc<Mutex<Connection>>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl SqliteWorkspaceMemberRepository {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: Pool<SqliteConnectionManager>) -> Self {
+        Self { pool }
     }
 
     fn row_to_member(row: &Row) -> std::result::Result<WorkspaceMember, rusqlite::Error> {
@@ -561,7 +707,7 @@ impl SqliteWorkspaceMemberRepository {
 
 impl WorkspaceMemberRepository for SqliteWorkspaceMemberRepository {
     fn add_member(&self, member: WorkspaceMember) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let role_str = match member.role {
             WorkspaceRole::Owner => "owner",
             WorkspaceRole::Admin => "admin",
@@ -582,7 +728,7 @@ impl WorkspaceMemberRepository for SqliteWorkspaceMemberRepository {
     }
 
     fn remove_member(&self, workspace_id: Uuid, user_id: Uuid) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "DELETE FROM workspace_members WHERE workspace_id = ?1 AND user_id = ?2",
             params![workspace_id.to_string(), user_id.to_string()],
@@ -591,7 +737,7 @@ impl WorkspaceMemberRepository for SqliteWorkspaceMemberRepository {
     }
 
     fn update_role(&self, workspace_id: Uuid, user_id: Uuid, role: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE workspace_members SET role = ?1 WHERE workspace_id = ?2 AND user_id = ?3",
             params![role, workspace_id.to_string(), user_id.to_string()],
@@ -600,7 +746,7 @@ impl WorkspaceMemberRepository for SqliteWorkspaceMemberRepository {
     }
 
     fn get_members(&self, workspace_id: Uuid) -> Result<Vec<WorkspaceMember>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM workspace_members WHERE workspace_id = ?1"
         )?;
@@ -612,7 +758,7 @@ impl WorkspaceMemberRepository for SqliteWorkspaceMemberRepository {
     }
 
     fn get_user_role(&self, workspace_id: Uuid, user_id: Uuid) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let result = conn.query_row(
             "SELECT role FROM workspace_members WHERE workspace_id = ?1 AND user_id = ?2",
             params![workspace_id.to_string(), user_id.to_string()],
@@ -627,12 +773,12 @@ impl WorkspaceMemberRepository for SqliteWorkspaceMemberRepository {
 }
 
 pub struct SqliteCommentRepository {
-    conn: Arc<Mutex<Connection>>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl SqliteCommentRepository {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: Pool<SqliteConnectionManager>) -> Self {
+        Self { pool }
     }
 
     fn row_to_comment(row: &Row) -> std::result::Result<Comment, rusqlite::Error> {
@@ -655,7 +801,7 @@ impl SqliteCommentRepository {
 
 impl CommentRepository for SqliteCommentRepository {
     fn create(&self, comment: Comment) -> Result<Uuid> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         
         // Calculate nested set if has parent
         let (lft, rgt, depth) = if let Some(parent_id) = comment.parent_id {
@@ -709,7 +855,7 @@ impl CommentRepository for SqliteCommentRepository {
     }
 
     fn update(&self, comment: Comment) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE comments SET content = ?2, data = ?3, updated_at = ?4 WHERE id = ?1",
             params![
@@ -723,13 +869,13 @@ impl CommentRepository for SqliteCommentRepository {
     }
 
     fn delete(&self, id: Uuid) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute("DELETE FROM comments WHERE id = ?1", params![id.to_string()])?;
         Ok(())
     }
 
     fn find_by_id(&self, id: Uuid) -> Result<Option<Comment>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let result = conn.query_row(
             "SELECT * FROM comments WHERE id = ?1",
             [id.to_string()],
@@ -743,7 +889,7 @@ impl CommentRepository for SqliteCommentRepository {
     }
 
     fn get_task_comments(&self, task_id: Uuid) -> Result<Vec<Comment>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM comments WHERE task_id = ?1 ORDER BY lft"
         )?;
@@ -755,7 +901,7 @@ impl CommentRepository for SqliteCommentRepository {
     }
 
     fn get_thread(&self, root_id: Uuid) -> Result<Vec<Comment>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let root = self.find_by_id(root_id)?;
         match root {
             Some(r) => {
@@ -771,15 +917,53 @@ impl CommentRepository for SqliteCommentRepository {
             None => Ok(vec![]),
         }
     }
+
+    fn add_mention(&self, comment_id: Uuid, mentioned_user_id: Uuid, workspace_id: Uuid) -> Result<()> {
+        let conn = self.pool.get()?;
+        let id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO comment_mentions (id, comment_id, mentioned_user_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.to_string(),
+                comment_id.to_string(),
+                mentioned_user_id.to_string(),
+                workspace_id.to_string(),
+                chrono::Utc::now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_user_mentions(&self, user_id: Uuid) -> Result<Vec<Uuid>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT comment_id FROM comment_mentions WHERE mentioned_user_id = ?1 AND is_read = 0"
+        )?;
+        let comment_ids = stmt.query_map(
+            [user_id.to_string()],
+            |row| Uuid::parse_str(row.get::<_, String>(0)?.as_str()).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        )?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(comment_ids)
+    }
+
+    fn mark_mention_read(&self, comment_id: Uuid, user_id: Uuid) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE comment_mentions SET is_read = 1 WHERE comment_id = ?1 AND mentioned_user_id = ?2",
+            params![comment_id.to_string(), user_id.to_string()],
+        )?;
+        Ok(())
+    }
 }
 
 pub struct SqliteEventLogRepository {
-    conn: Arc<Mutex<Connection>>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl SqliteEventLogRepository {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(pool: Pool<SqliteConnectionManager>) -> Self {
+        Self { pool }
     }
 
     fn row_to_event(row: &Row) -> std::result::Result<EventLog, rusqlite::Error> {
@@ -790,24 +974,28 @@ impl SqliteEventLogRepository {
             entity_type: row.get(3)?,
             entity_id: row.get(4)?,
             data: serde_json::from_str(row.get::<_, String>(5)?.as_str()).unwrap_or_default(),
-            workspace_id: row.get::<_, Option<String>>(6)?.and_then(|s| Uuid::parse_str(&s).ok()),
-            created_at: row.get(7)?,
+            previous_value: row.get(6)?,
+            new_value: row.get(7)?,
+            workspace_id: row.get::<_, Option<String>>(8)?.and_then(|s| Uuid::parse_str(&s).ok()),
+            created_at: row.get(9)?,
         })
     }
 }
 
 impl EventLogRepository for SqliteEventLogRepository {
     fn log(&self, event: EventLog) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         conn.execute(
-            "INSERT INTO event_log (user_id, event_type, entity_type, entity_id, data, workspace_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO event_log (user_id, event_type, entity_type, entity_id, data, previous_value, new_value, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 event.user_id.to_string(),
                 event.event_type,
                 event.entity_type,
                 event.entity_id,
                 serde_json::to_string(&event.data)?,
+                event.previous_value,
+                event.new_value,
                 event.workspace_id.map(|id| id.to_string()),
                 event.created_at,
             ],
@@ -816,7 +1004,7 @@ impl EventLogRepository for SqliteEventLogRepository {
     }
 
     fn get_user_events(&self, user_id: Uuid, limit: i64) -> Result<Vec<EventLog>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM event_log WHERE user_id = ?1 ORDER BY created_at DESC LIMIT ?2"
         )?;
@@ -828,7 +1016,7 @@ impl EventLogRepository for SqliteEventLogRepository {
     }
 
     fn get_workspace_events(&self, workspace_id: Uuid, limit: i64) -> Result<Vec<EventLog>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM event_log WHERE workspace_id = ?1 ORDER BY created_at DESC LIMIT ?2"
         )?;
@@ -840,7 +1028,7 @@ impl EventLogRepository for SqliteEventLogRepository {
     }
 
     fn get_entity_events(&self, entity_type: &str, entity_id: &str, limit: i64) -> Result<Vec<EventLog>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM event_log WHERE entity_type = ?1 AND entity_id = ?2 ORDER BY created_at DESC LIMIT ?3"
         )?;
@@ -849,5 +1037,89 @@ impl EventLogRepository for SqliteEventLogRepository {
             |row| SqliteEventLogRepository::row_to_event(row)
         )?.collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(events)
+    }
+}
+
+pub struct SqliteCustomFieldRepository {
+    pool: Pool<SqliteConnectionManager>,
+}
+
+impl SqliteCustomFieldRepository {
+    pub fn new(pool: Pool<SqliteConnectionManager>) -> Self {
+        Self { pool }
+    }
+
+    fn row_to_custom_field(row: &Row) -> std::result::Result<CustomField, rusqlite::Error> {
+        Ok(CustomField {
+            id: Uuid::parse_str(row.get::<_, String>(0)?.as_str()).unwrap_or_else(|_| Uuid::nil()),
+            workspace_id: Uuid::parse_str(row.get::<_, String>(1)?.as_str()).unwrap_or_else(|_| Uuid::nil()),
+            field_name: row.get(2)?,
+            field_type: CustomFieldType::from_str(row.get::<_, String>(3)?.as_str()),
+            field_options: row.get(4)?,
+            is_required: row.get(5)?,
+            created_at: row.get(6)?,
+        })
+    }
+}
+
+impl CustomFieldRepository for SqliteCustomFieldRepository {
+    fn create(&self, workspace_id: Uuid, field_name: &str, field_type: &str, field_options: Option<&str>, is_required: bool) -> Result<Uuid> {
+        let conn = self.pool.get()?;
+        let id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO workspace_custom_fields (id, workspace_id, field_name, field_type, field_options, is_required, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id.to_string(),
+                workspace_id.to_string(),
+                field_name,
+                field_type,
+                field_options,
+                is_required,
+                chrono::Utc::now(),
+            ],
+        )?;
+        Ok(id)
+    }
+
+    fn find_by_id(&self, id: Uuid) -> Result<Option<CustomField>> {
+        let conn = self.pool.get()?;
+        let result = conn.query_row(
+            "SELECT * FROM workspace_custom_fields WHERE id = ?1",
+            [id.to_string()],
+            |row| SqliteCustomFieldRepository::row_to_custom_field(row)
+        );
+        match result {
+            Ok(field) => Ok(Some(field)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn get_workspace_fields(&self, workspace_id: Uuid) -> Result<Vec<CustomField>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM workspace_custom_fields WHERE workspace_id = ?1"
+        )?;
+        let fields = stmt.query_map(
+            [workspace_id.to_string()],
+            |row| SqliteCustomFieldRepository::row_to_custom_field(row)
+        )?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(fields)
+    }
+
+    fn update(&self, id: Uuid, field_name: &str, field_options: Option<&str>, is_required: bool) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE workspace_custom_fields SET field_name = ?2, field_options = ?3, is_required = ?4 WHERE id = ?1",
+            params![id.to_string(), field_name, field_options, is_required],
+        )?;
+        Ok(())
+    }
+
+    fn delete(&self, id: Uuid) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute("DELETE FROM workspace_custom_fields WHERE id = ?1", params![id.to_string()])?;
+        Ok(())
     }
 }

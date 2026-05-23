@@ -64,6 +64,12 @@ impl ExportService {
         // For now, return placeholder
         Ok(Uuid::new_v4())
     }
+
+    pub async fn export_workspace_pdf(&self, _workspace_id: Uuid) -> Result<Vec<u8>> {
+        // PDF export requires additional dependencies (genpdf or similar)
+        // For now, return an error indicating this feature is not yet implemented
+        Err(anyhow::anyhow!("PDF export not yet implemented - requires PDF generation library"))
+    }
 }
 
 fn escape_csv(value: &str) -> String {

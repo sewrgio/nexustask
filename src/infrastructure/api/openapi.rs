@@ -1,6 +1,5 @@
 use utoipa::OpenApi;
 use axum::{
-    routing::get,
     Json,
     response::IntoResponse,
 };
