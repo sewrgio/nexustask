@@ -18,4 +18,6 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+  // 4. point to the frontend directory
+  root: "frontend",
 }));

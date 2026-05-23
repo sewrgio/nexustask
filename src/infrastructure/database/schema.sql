@@ -3,29 +3,6 @@
 
 PRAGMA foreign_keys = ON;
 
--- Full-Text Search for Tasks
-CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
-    title,
-    description,
-    content='tasks',
-    content_rowid='id'
-);
-
--- Triggers to keep FTS in sync
-CREATE TRIGGER IF NOT EXISTS tasks_fts_insert AFTER INSERT ON tasks BEGIN
-    INSERT INTO tasks_fts(rowid, title, description)
-    VALUES (new.id, new.title, new.description);
-END;
-
-CREATE TRIGGER IF NOT EXISTS tasks_fts_delete AFTER DELETE ON tasks BEGIN
-    DELETE FROM tasks_fts WHERE rowid = old.id;
-END;
-
-CREATE TRIGGER IF NOT EXISTS tasks_fts_update AFTER UPDATE ON tasks BEGIN
-    UPDATE tasks_fts SET title = new.title, description = new.description
-    WHERE rowid = new.id;
-END;
-
 -- 1. Workspaces (Multi-team isolation)
 CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
@@ -99,6 +76,29 @@ CREATE INDEX IF NOT EXISTS idx_tasks_hierarchy ON tasks(workspace_id, lft, rgt);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
 CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON tasks(workspace_id);
+
+-- Full-Text Search for Tasks
+CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+    title,
+    description,
+    content='tasks',
+    content_rowid='id'
+);
+
+-- Triggers to keep FTS in sync
+CREATE TRIGGER IF NOT EXISTS tasks_fts_insert AFTER INSERT ON tasks BEGIN
+    INSERT INTO tasks_fts(rowid, title, description)
+    VALUES (new.id, new.title, new.description);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_fts_delete AFTER DELETE ON tasks BEGIN
+    DELETE FROM tasks_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS tasks_fts_update AFTER UPDATE ON tasks BEGIN
+    UPDATE tasks_fts SET title = new.title, description = new.description
+    WHERE rowid = new.id;
+END;
 
 -- 5. Comments
 CREATE TABLE IF NOT EXISTS comments (

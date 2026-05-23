@@ -4,7 +4,6 @@ mod ports;
 mod infrastructure;
 mod state;
 
-use crate::infrastructure::ui::app::NexusTaskApp;
 use crate::infrastructure::api::start_api_server;
 use crate::infrastructure::database::{init_db, sqlite_repo, auth_provider};
 use crate::application::{task_service, user_service, workspace_service};
@@ -14,7 +13,7 @@ use crate::state::AppState;
 use std::sync::{Arc, Mutex};
 
 #[tokio::main]
-async fn main() -> Result<(), eframe::Error> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     // 1. Initialize Database
@@ -59,21 +58,8 @@ async fn main() -> Result<(), eframe::Error> {
         jwt_secret,
     };
 
-    // 6. Start API Server in a separate thread
-    let app_state_clone = app_state.clone();
-    tokio::spawn(async move {
-        start_api_server(app_state_clone).await;
-    });
+    // 6. Start API Server (blocking call)
+    start_api_server(app_state).await;
 
-    // 7. Start UI in the main thread
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
-        ..Default::default()
-    };
-    
-    eframe::run_native(
-        "NexusTask Enterprise",
-        options,
-        Box::new(|cc| Box::new(NexusTaskApp::new(cc, app_state))),
-    )
+    Ok(())
 }

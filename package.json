@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "dev:all": "concurrently \"cargo run\" \"TAURI_SCTK_ADWAITA_NO_PORTAL=1 pnpm tauri dev\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0-rc.0",
@@ -22,6 +23,7 @@
     "@types/react-dom": "^18.2.22",
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.18",
+    "concurrently": "^9.2.1",
     "postcss": "^8.4.35",
     "tailwindcss": "^3.4.1",
     "typescript": "^5.2.2",
